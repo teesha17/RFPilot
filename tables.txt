@@ -1,0 +1,991 @@
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+CREATE OR REPLACE FUNCTION set_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+  NEW.updated_at = NOW();
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- NOTE:
+-- standards and tests use SERIAL because they are global reference tables
+-- not exposed externally and do not require global uniqueness
+
+-- ------------------------------------------------------------
+-- TABLE: companies
+-- Root table — every other table links back to this
+-- One row = one tenant (one cable manufacturer using RFPilot)
+-- ------------------------------------------------------------
+
+CREATE TABLE companies (
+  company_id        UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+  company_name      VARCHAR(255) NOT NULL,
+  industry_vertical VARCHAR(100) NOT NULL DEFAULT 'cables',
+  subscription_tier VARCHAR(20)  NOT NULL DEFAULT 'basic',
+  is_active         BOOLEAN      NOT NULL DEFAULT TRUE,
+  created_at        TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+  updated_at        TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+  CONSTRAINT chk_subscription_tier CHECK (subscription_tier IN ('basic','pro','enterprise')),
+  CONSTRAINT chk_industry_vertical CHECK (industry_vertical IN ('cables','steel_pipes','switchgear','pumps'))
+);
+CREATE TRIGGER trg_companies_updated_at BEFORE UPDATE ON companies FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- ------------------------------------------------------------
+-- TABLE: standards
+-- Global table — shared across all companies
+-- Stores IS, IEC, BS, DIN standards with full descriptions
+-- description is embedded into ChromaDB for semantic search
+-- ------------------------------------------------------------
+
+CREATE TABLE standards (
+  standard_id      SERIAL        PRIMARY KEY,
+  standard_code    VARCHAR(50)   NOT NULL,
+  standard_name    VARCHAR(255)  NOT NULL,
+  issuing_body     VARCHAR(50)   NOT NULL,
+  description      TEXT          NOT NULL,
+  version          VARCHAR(20),
+  is_active        BOOLEAN       NOT NULL DEFAULT TRUE,
+  last_embedded_at TIMESTAMPTZ,
+  CONSTRAINT uq_standard_code UNIQUE (standard_code),
+  CONSTRAINT chk_issuing_body CHECK (issuing_body IN ('IS','IEC','BS','DIN','VDE','ASTM'))
+);
+
+
+
+-- ------------------------------------------------------------
+-- TABLE: tests
+-- Defines all possible cable tests with classification
+-- description is embedded into ChromaDB for semantic search
+-- Linked to the standard that mandates each test
+-- ------------------------------------------------------------
+
+CREATE TABLE tests (
+  test_id        SERIAL        PRIMARY KEY,
+  test_name      VARCHAR(100)  NOT NULL,
+  test_category  VARCHAR(50)   NOT NULL,
+  test_type      VARCHAR(20)   NOT NULL,
+  description    TEXT          NOT NULL, -- NOT NULL: used for ChromaDB RAG embeddings
+  standard_id    INT           REFERENCES standards(standard_id) ON DELETE RESTRICT,
+  is_active      BOOLEAN       NOT NULL DEFAULT TRUE,
+  last_embedded_at TIMESTAMPTZ,          -- NULL = not yet embedded into ChromaDB
+
+  CONSTRAINT uq_test_name UNIQUE (test_name),
+
+  CONSTRAINT chk_test_category
+    CHECK (test_category IN ('electrical', 'mechanical', 'thermal')),
+
+  CONSTRAINT chk_test_type
+    CHECK (test_type IN ('type', 'routine', 'sample'))
+);
+
+
+
+
+-- ============================================================
+-- LEVEL 1 — Depends on companies only
+-- ============================================================
+
+
+-- ------------------------------------------------------------
+-- TABLE: company_config
+-- Per-tenant configuration — agent thresholds, default margins
+-- Replaces all hardcoded values in agent Python code
+-- One row per company (PK = company_id)
+-- ------------------------------------------------------------
+
+CREATE TABLE company_config (
+  company_id               UUID         PRIMARY KEY REFERENCES companies(company_id) ON DELETE CASCADE,
+  auto_accept_threshold    NUMERIC(5,4) NOT NULL DEFAULT 0.85,
+  hitl_trigger_threshold   NUMERIC(5,4) NOT NULL DEFAULT 0.50,
+  default_margin_pct       NUMERIC(5,2) NOT NULL DEFAULT 12.0,
+  tender_portal_urls       JSONB,        -- ["https://eprocure.gov.in", "https://gem.gov.in"]
+  max_active_rfps          INT          NOT NULL DEFAULT 10,
+  created_at               TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+  updated_at               TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+
+  -- auto_accept must always be higher than hitl_trigger
+  CONSTRAINT chk_threshold_order
+    CHECK (hitl_trigger_threshold < auto_accept_threshold),
+
+  CONSTRAINT chk_auto_accept_range
+    CHECK (auto_accept_threshold BETWEEN 0 AND 1),
+
+  CONSTRAINT chk_hitl_trigger_range
+    CHECK (hitl_trigger_threshold BETWEEN 0 AND 1),
+
+  CONSTRAINT chk_margin_positive
+    CHECK (default_margin_pct >= 0)
+);
+
+CREATE TRIGGER trg_company_config_updated_at
+  BEFORE UPDATE ON company_config
+  FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+
+
+
+-- ------------------------------------------------------------
+-- TABLE: users
+-- All users of all companies — role-based access control
+-- Supports external auth providers (Clerk, Supabase etc.)
+-- ------------------------------------------------------------
+
+CREATE TABLE users (
+  user_id           UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+  company_id        UUID         NOT NULL REFERENCES companies(company_id) ON DELETE CASCADE,
+  email             VARCHAR(255) NOT NULL,
+  full_name         VARCHAR(255),
+  role              VARCHAR(30)  NOT NULL,
+  auth_provider_id  VARCHAR(255),
+  is_active         BOOLEAN      NOT NULL DEFAULT TRUE,
+  last_login_at     TIMESTAMPTZ,           -- NULL = never logged in
+  created_at        TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+  updated_at        TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+
+  CONSTRAINT uq_user_email UNIQUE (email),
+  
+  CONSTRAINT chk_user_role
+  CHECK (role IN (
+    'admin',              -- full access, manages company setup
+    'sales_manager',      -- approves RFP relevance, enters bid outcomes
+    'technical_manager',  -- reviews product matches, resolves HITL
+    'pricing_manager',    -- approves pricing calculations
+    'sales_executive',    -- reviews and submits final proposal
+    'viewer',             -- read-only dashboard access
+    'agent'               -- system user for agent execution logs
+  ))
+);
+
+CREATE TRIGGER trg_users_updated_at
+  BEFORE UPDATE ON users
+  FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- Index: permission checks on every API request
+CREATE INDEX idx_users_company_role
+  ON users (company_id, role, is_active)
+  WHERE is_active = TRUE;
+
+
+
+
+-- ------------------------------------------------------------
+-- TABLE: client_profile
+-- LSTK contractors and clients per company
+-- Stores pricing intelligence and relationship context
+-- ------------------------------------------------------------
+
+CREATE TABLE client_profile (
+  client_id           UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+  company_id          UUID        NOT NULL REFERENCES companies(company_id) ON DELETE CASCADE,
+  client_name         VARCHAR(255) NOT NULL,
+  client_type         VARCHAR(50)  NOT NULL DEFAULT 'private',
+  sector              VARCHAR(100),
+  price_sensitivity   VARCHAR(20)  NOT NULL DEFAULT 'medium',
+  relationship_status VARCHAR(20)  NOT NULL DEFAULT 'prospect',
+  is_active           BOOLEAN      NOT NULL DEFAULT TRUE,
+  created_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+  updated_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+
+  -- This UNIQUE is NOT redundant.
+  -- It exists specifically to support the composite FK from rfp_documents:
+  -- (issuer_client_id, company_id) → client_profile(client_id, company_id)
+  -- This enforces that a client referenced in an RFP belongs to that company.
+  -- DO NOT DROP THIS CONSTRAINT.
+  CONSTRAINT uq_client_company UNIQUE (client_id, company_id),
+
+  CONSTRAINT chk_client_type
+    CHECK (client_type IN ('LSTK_contractor', 'PSU', 'private', 'government')),
+
+  CONSTRAINT chk_price_sensitivity
+    CHECK (price_sensitivity IN ('low', 'medium', 'high')),
+
+  CONSTRAINT chk_relationship_status
+    CHECK (relationship_status IN ('prospect', 'active', 'inactive', 'churned'))
+);
+
+CREATE TRIGGER trg_client_profile_updated_at
+  BEFORE UPDATE ON client_profile
+  FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- Index: fetch all active clients for a company
+CREATE INDEX idx_client_profile_company
+  ON client_profile (company_id, is_active)
+  WHERE is_active = TRUE;
+
+
+
+
+
+-- ============================================================
+-- LEVEL 2 — Depends on Level 0 + Level 1
+-- ============================================================
+
+
+-- ------------------------------------------------------------
+-- TABLE: product_catalog
+-- All cable SKUs per company
+-- Core matching table — every field is a matching dimension
+-- ------------------------------------------------------------
+
+CREATE TABLE product_catalog (
+  sku_id              UUID          PRIMARY KEY DEFAULT gen_random_uuid(),
+  company_id          UUID          NOT NULL REFERENCES companies(company_id) ON DELETE CASCADE,
+  sku_code            VARCHAR(50)   NOT NULL,
+  product_name        VARCHAR(255),
+  voltage_kv          NUMERIC(6,2)  NOT NULL, -- NOT NULL: core matching field
+  conductor_material  VARCHAR(50)   NOT NULL, -- NOT NULL: core matching field
+  cross_section_mm2   NUMERIC(6,2)  NOT NULL, -- NOT NULL: core matching field
+  insulation_type     VARCHAR(50)   NOT NULL, -- NOT NULL: core matching field
+  armoured            BOOLEAN       NOT NULL DEFAULT FALSE, -- NOT NULL: core matching field
+  number_of_cores     INT           NOT NULL DEFAULT 1,     -- NOT NULL: core matching field
+  price_per_meter     NUMERIC(10,2) NOT NULL, -- NOT NULL: required for pricing calculations
+  stock_meters        INT,
+  lead_time_days      INT,
+  is_active           BOOLEAN       NOT NULL DEFAULT TRUE,
+  created_at          TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+  updated_at          TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+
+  CONSTRAINT uq_sku_code_per_company UNIQUE (company_id, sku_code),
+
+  CONSTRAINT chk_conductor_material
+    CHECK (conductor_material IN ('copper', 'aluminium')),
+
+  CONSTRAINT chk_insulation_type
+    CHECK (insulation_type IN ('XLPE', 'PVC', 'EPR', 'HEPR')),
+
+  CONSTRAINT chk_price_positive
+    CHECK (price_per_meter > 0),
+
+  CONSTRAINT chk_cores_positive
+    CHECK (number_of_cores > 0)
+);
+
+CREATE TRIGGER trg_product_catalog_updated_at
+  BEFORE UPDATE ON product_catalog
+  FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- Composite partial index: the exact query the Technical Agent runs on every match
+-- company_id first (multi-tenant), then all matching dimensions
+-- WHERE is_active = TRUE excludes soft-deleted SKUs from the index entirely
+CREATE INDEX idx_product_catalog_matching
+  ON product_catalog (
+    company_id,
+    voltage_kv,
+    conductor_material,
+    cross_section_mm2,
+    insulation_type,
+    number_of_cores,
+    armoured
+  )
+  WHERE is_active = TRUE;
+
+
+
+
+-- ------------------------------------------------------------
+-- BRIDGE TABLE: product_standards
+-- Many-to-many: product_catalog ↔ standards
+-- Records which standards each SKU is certified against
+-- ------------------------------------------------------------
+
+CREATE TABLE product_standards (
+  sku_id       UUID  NOT NULL REFERENCES product_catalog(sku_id) ON DELETE CASCADE,
+  standard_id  INT   NOT NULL REFERENCES standards(standard_id)  ON DELETE RESTRICT,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  
+  PRIMARY KEY (sku_id, standard_id)
+  -- CASCADE on sku: product deleted → its standard links deleted automatically
+  -- RESTRICT on standard: can't delete a standard if products still reference it
+  -- we define all the delete behavior wherever we mention the FK relationship
+);
+
+
+-- ------------------------------------------------------------
+-- BRIDGE TABLE: client_preferred_standards
+-- Many-to-many: client_profile ↔ standards
+-- Records which standards a client prefers in their RFPs
+-- ------------------------------------------------------------
+
+CREATE TABLE client_preferred_standards (
+  client_id    UUID  NOT NULL REFERENCES client_profile(client_id) ON DELETE CASCADE,
+  standard_id  INT   NOT NULL REFERENCES standards(standard_id)    ON DELETE RESTRICT,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+  PRIMARY KEY (client_id, standard_id)
+);
+
+
+
+
+-- ============================================================
+-- LEVEL 3 — Depends on Level 1 + Level 2
+-- ============================================================
+
+
+-- ------------------------------------------------------------
+-- TABLE: rfp_documents
+-- Cover page of each RFP — metadata and pipeline state
+-- One row per RFP received by a company
+-- ------------------------------------------------------------
+
+CREATE TABLE rfp_documents (
+  rfp_id           UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+  company_id       UUID         NOT NULL REFERENCES companies(company_id) ON DELETE CASCADE,
+  issuer_client_id UUID,        -- nullable: client may not be in system yet
+  tender_ref       VARCHAR(100),
+  project_name     VARCHAR(255),
+  deadline         TIMESTAMPTZ,
+  status           VARCHAR(20)  NOT NULL DEFAULT 'new',
+  relevance_label  VARCHAR(10), -- set by Sales Agent: high/medium/low
+  document_path    VARCHAR(500) NOT NULL, -- NOT NULL: PDF parser needs this
+  created_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+  updated_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+
+  CONSTRAINT chk_rfp_status
+    CHECK (status IN ('new', 'processing', 'matched', 'submitted')),
+
+  CONSTRAINT chk_relevance_label
+    CHECK (relevance_label IN ('high', 'medium', 'low')),
+
+  -- Composite FK: ensures client belongs to the same company as this RFP
+  -- Requires UNIQUE (client_id, company_id) on client_profile — DO NOT DROP THAT
+  CONSTRAINT fk_rfp_client_company
+    FOREIGN KEY (issuer_client_id, company_id)
+    REFERENCES client_profile(client_id, company_id)
+    ON DELETE SET NULL
+);
+
+CREATE TRIGGER trg_rfp_documents_updated_at
+  BEFORE UPDATE ON rfp_documents
+  FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- Partial index: active pipeline query — dashboard loads this on every page open
+-- Excludes submitted RFPs (historical, rarely queried)
+CREATE INDEX idx_rfp_documents_pipeline
+  ON rfp_documents (company_id, status, deadline)
+  WHERE status IN ('new', 'processing', 'matched');
+
+
+
+-- ------------------------------------------------------------
+-- TABLE: product_performance
+-- Per-SKU per-client delivery and complaint metrics
+-- Feeds pricing intelligence — complaint_rate is auto-computed
+-- ------------------------------------------------------------
+
+CREATE TABLE product_performance (
+  performance_id       UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+  sku_id               UUID         NOT NULL REFERENCES product_catalog(sku_id) ON DELETE CASCADE,
+  client_id            UUID         NOT NULL REFERENCES client_profile(client_id) ON DELETE CASCADE,
+  company_id           UUID         NOT NULL REFERENCES companies(company_id) ON DELETE CASCADE,
+  total_orders         INT          NOT NULL DEFAULT 0,
+  complaint_count      INT          NOT NULL DEFAULT 0,
+
+  -- GENERATED ALWAYS: auto-computed by PostgreSQL, never manually set
+  -- NULLIF prevents division by zero when total_orders = 0
+  complaint_rate       NUMERIC(5,4) GENERATED ALWAYS AS (
+                         complaint_count::NUMERIC / NULLIF(total_orders, 0)
+                       ) STORED,
+
+  avg_delivery_delay_days NUMERIC(5,2),
+  last_updated         TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+
+  -- One row per SKU per client — no duplicates allowed
+  CONSTRAINT uq_performance_sku_client UNIQUE (sku_id, client_id),
+
+  CONSTRAINT chk_orders_non_negative
+    CHECK (total_orders >= 0),
+
+  CONSTRAINT chk_complaints_non_negative
+    CHECK (complaint_count >= 0),
+
+  -- Complaint count can never exceed total orders
+  CONSTRAINT chk_complaints_lte_orders
+    CHECK (complaint_count <= total_orders)
+);
+
+-- Index: Pricing Agent reads this per SKU per client on every bid calculation
+CREATE INDEX idx_product_performance_sku_client
+  ON product_performance (sku_id, client_id);
+
+
+
+
+
+
+-- ============================================================
+-- LEVEL 4 — Depends on Level 3
+-- ============================================================
+
+
+-- ------------------------------------------------------------
+-- TABLE: rfp_items
+-- Individual cable line items extracted from an RFP
+-- One rfp_document has many rfp_items
+-- Every field here is a matching dimension — all NOT NULL
+-- ------------------------------------------------------------
+
+CREATE TABLE rfp_items (
+  item_id            UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+  rfp_id             UUID         NOT NULL REFERENCES rfp_documents(rfp_id) ON DELETE CASCADE,
+  item_no            INT          NOT NULL,
+  voltage_kv         NUMERIC(6,2) NOT NULL, -- NOT NULL: core matching field
+  conductor_material VARCHAR(50)  NOT NULL, -- NOT NULL: core matching field
+  cross_section_mm2  NUMERIC(6,2) NOT NULL, -- NOT NULL: core matching field
+  insulation_type    VARCHAR(50)  NOT NULL, -- NOT NULL: core matching field
+  armoured           BOOLEAN      NOT NULL DEFAULT FALSE, -- NOT NULL: core matching field
+  number_of_cores    INT          NOT NULL, -- NOT NULL: core matching field
+  quantity           NUMERIC(10,2) NOT NULL, -- NOT NULL: required for pricing
+  unit               VARCHAR(20)  NOT NULL DEFAULT 'meters',
+  delivery_location  VARCHAR(255),
+  created_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+
+  -- Each item_no must be unique within an RFP (line 1, 2, 3...)
+  CONSTRAINT uq_rfp_item_no UNIQUE (rfp_id, item_no),
+
+  CONSTRAINT chk_item_conductor
+    CHECK (conductor_material IN ('copper', 'aluminium')),
+
+  CONSTRAINT chk_item_insulation
+    CHECK (insulation_type IN ('XLPE', 'PVC', 'EPR', 'HEPR')),
+
+  CONSTRAINT chk_item_unit
+    CHECK (unit IN ('meters', 'km', 'drums')),
+
+  CONSTRAINT chk_item_quantity_positive
+    CHECK (quantity > 0),
+
+  CONSTRAINT chk_item_cores_positive
+    CHECK (number_of_cores > 0)
+);
+
+-- Index: fetch all items for an RFP (first thing Technical Agent does)
+CREATE INDEX idx_rfp_items_rfp_id ON rfp_items (rfp_id);
+
+-- Composite index: matching dimension lookups
+CREATE INDEX idx_rfp_items_matching
+  ON rfp_items (rfp_id, voltage_kv, conductor_material, cross_section_mm2, insulation_type, number_of_cores, armoured);
+
+
+
+
+-- ------------------------------------------------------------
+-- TABLE: market_pricing
+-- Global benchmark price ranges from public tender data
+-- Used by Pricing Agent to validate competitive positioning
+-- ------------------------------------------------------------
+
+CREATE TABLE market_pricing (
+  pricing_id         UUID          PRIMARY KEY DEFAULT gen_random_uuid(),
+  product_category   VARCHAR(100)  NOT NULL,
+  voltage_kv         NUMERIC(6,2)  NOT NULL,
+  conductor_material VARCHAR(50)   NOT NULL,
+  cross_section_mm2  NUMERIC(6,2)  NOT NULL,
+  standard_id        INT           REFERENCES standards(standard_id) ON DELETE SET NULL,
+  min_market_price   NUMERIC(12,2),
+  max_market_price   NUMERIC(12,2),
+  avg_market_price   NUMERIC(12,2),
+  sample_size        INT           NOT NULL DEFAULT 0,
+  last_updated       TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+
+  -- Prevents duplicate benchmark entries for the same cable spec
+  -- Enables safe upsert: INSERT ... ON CONFLICT DO UPDATE SET prices
+  CONSTRAINT uq_market_pricing_dimensions
+    UNIQUE (product_category, voltage_kv, conductor_material, cross_section_mm2, standard_id),
+
+  CONSTRAINT chk_market_conductor
+    CHECK (conductor_material IN ('copper', 'aluminium')),
+
+  CONSTRAINT chk_price_range_valid
+    CHECK (min_market_price <= max_market_price)
+);
+
+-- Index: exact query the Pricing Agent runs on every bid calculation
+CREATE INDEX idx_market_pricing_lookup
+  ON market_pricing (voltage_kv, conductor_material, cross_section_mm2);
+
+
+
+
+-- ============================================================
+-- LEVEL 5 — Depends on Level 4 (rfp_items)
+-- ============================================================
+
+
+-- ------------------------------------------------------------
+-- BRIDGE TABLE: rfp_item_standards
+-- Many-to-many: rfp_items ↔ standards
+-- Standards required by each cable line item in the RFP
+-- ------------------------------------------------------------
+
+CREATE TABLE rfp_item_standards (
+  item_id      UUID  NOT NULL REFERENCES rfp_items(item_id)    ON DELETE CASCADE,
+  standard_id  INT   NOT NULL REFERENCES standards(standard_id) ON DELETE RESTRICT,
+
+  PRIMARY KEY (item_id, standard_id)
+);
+
+
+-- ------------------------------------------------------------
+-- BRIDGE TABLE: rfp_item_tests
+-- Many-to-many: rfp_items ↔ tests
+-- Tests required for each cable line item in the RFP
+-- ------------------------------------------------------------
+
+CREATE TABLE rfp_item_tests (
+  item_id   UUID  NOT NULL REFERENCES rfp_items(item_id) ON DELETE CASCADE,
+  test_id   INT   NOT NULL REFERENCES tests(test_id)     ON DELETE RESTRICT,
+
+  PRIMARY KEY (item_id, test_id)
+);
+
+
+
+
+-- ------------------------------------------------------------
+-- TABLE: product_matches
+-- Technical Agent matching results — hybrid search scores
+-- Stores top-3 matches per rfp_item with all scoring details
+-- ------------------------------------------------------------
+
+CREATE TABLE product_matches (
+  match_id          UUID          PRIMARY KEY DEFAULT gen_random_uuid(),
+  rfp_item_id       UUID          NOT NULL REFERENCES rfp_items(item_id)       ON DELETE CASCADE,
+  sku_id            UUID          NOT NULL REFERENCES product_catalog(sku_id)   ON DELETE CASCADE,
+  company_id        UUID          NOT NULL REFERENCES companies(company_id)     ON DELETE CASCADE,
+  bm25_score        NUMERIC(5,4),  -- nullable: BM25 may fail on some inputs
+  semantic_score    NUMERIC(5,4),  -- nullable: ChromaDB may fail on some inputs
+  rrf_score         NUMERIC(5,4)   NOT NULL, -- NOT NULL: final merged score must always exist
+  llm_rerank_score  NUMERIC(5,4),
+  match_rank        INT            NOT NULL,
+  is_selected       BOOLEAN        NOT NULL DEFAULT FALSE,
+  match_status      VARCHAR(30)    NOT NULL DEFAULT 'pending',
+  reviewed_by       UUID           REFERENCES users(user_id) ON DELETE SET NULL,
+  reviewed_at       TIMESTAMPTZ,
+  created_at        TIMESTAMPTZ    NOT NULL DEFAULT NOW(),
+  updated_at 		TIMESTAMPTZ    NOT NULL DEFAULT NOW(),
+
+  -- A SKU can only appear once per rfp_item
+  CONSTRAINT uq_match_per_item_sku UNIQUE (rfp_item_id, sku_id),
+
+  CONSTRAINT chk_rrf_score_range
+    CHECK (rrf_score BETWEEN 0 AND 1),
+
+  CONSTRAINT chk_bm25_score_range
+    CHECK (bm25_score BETWEEN 0 AND 1),
+
+  CONSTRAINT chk_semantic_score_range
+    CHECK (semantic_score BETWEEN 0 AND 1),
+
+  CONSTRAINT chk_match_status
+    CHECK (match_status IN (
+      'auto_accepted',
+      'pending_review',
+      'human_approved',
+      'human_overridden',
+      'hitl_triggered'
+    )),
+
+  CONSTRAINT chk_match_rank_positive
+    CHECK (match_rank > 0)
+);
+
+
+CREATE TRIGGER trg_product_matches_updated_at
+BEFORE UPDATE ON product_matches
+FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- Index: dashboard loads top-3 matches per item ordered by rank
+CREATE INDEX idx_product_matches_item_rank
+  ON product_matches (rfp_item_id, match_rank);
+
+-- Index: reverse lookup — which RFPs has this SKU been matched against?
+CREATE INDEX idx_product_matches_sku
+  ON product_matches (sku_id);
+
+
+-- Partial unique index: only ONE selected product per rfp_item
+-- Enforces business rule: you can't select two products for the same line item
+CREATE UNIQUE INDEX uq_one_selected_per_item
+  ON product_matches (rfp_item_id)
+  WHERE is_selected = TRUE;
+
+
+
+
+-- ============================================================
+-- LEVEL 6 — Depends on Level 5 (product_matches)
+-- ============================================================
+
+
+-- ------------------------------------------------------------
+-- TABLE: pricing_calculations
+-- Full bid price breakdown per line item
+-- Hard HOTL gate — approved_by and approved_at are mandatory
+-- ------------------------------------------------------------
+
+CREATE TABLE pricing_calculations (
+  pricing_id              UUID          PRIMARY KEY DEFAULT gen_random_uuid(),
+  rfp_item_id             UUID          NOT NULL REFERENCES rfp_items(item_id)     ON DELETE CASCADE,
+  sku_id                  UUID          NOT NULL REFERENCES product_catalog(sku_id) ON DELETE CASCADE,
+  company_id              UUID          NOT NULL REFERENCES companies(company_id)   ON DELETE CASCADE,
+  quantity                NUMERIC(10,2) NOT NULL, -- NOT NULL: required for price formula
+  base_price              NUMERIC(12,2),
+  material_cost           NUMERIC(12,2),
+  testing_cost            NUMERIC(12,2),
+  margin                  NUMERIC(5,2),
+  market_price_min_used   NUMERIC(12,2),
+  market_price_max_used   NUMERIC(12,2),
+  is_within_market_range  BOOLEAN,
+  total_bid_price         NUMERIC(14,2),
+  pricing_status          VARCHAR(20)   NOT NULL DEFAULT 'draft',
+  human_edited            BOOLEAN       NOT NULL DEFAULT FALSE,
+  approved_by             UUID          REFERENCES users(user_id) ON DELETE SET NULL,
+  approved_at             TIMESTAMPTZ,  -- set when Pricing Manager approves
+  created_at              TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+  updated_at 		      TIMESTAMPTZ    NOT NULL DEFAULT NOW(),
+
+  
+
+  CONSTRAINT chk_pricing_status
+    CHECK (pricing_status IN ('draft', 'pending_approval', 'approved', 'overridden')),
+
+  CONSTRAINT chk_quantity_positive
+    CHECK (quantity > 0),
+
+  -- If approved, both approved_by and approved_at must be set together
+  CONSTRAINT chk_approval_consistency
+    CHECK (
+      (pricing_status = 'approved' AND approved_by IS NOT NULL AND approved_at IS NOT NULL)
+      OR pricing_status != 'approved'
+    )
+);
+
+CREATE TRIGGER trg_pricing_calculations_updated_at
+BEFORE UPDATE ON pricing_calculations
+FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- Index: fetch all pricing rows for an RFP (Response Generator reads these)
+CREATE INDEX idx_pricing_rfp_item
+  ON pricing_calculations (rfp_item_id);
+
+-- Index: tenant-scoped pricing queries
+CREATE INDEX idx_pricing_company
+  ON pricing_calculations (company_id, pricing_status);
+
+
+
+
+
+-- ------------------------------------------------------------
+-- TABLE: custom_product_requests
+-- HITL workflow — triggered when no product match found (<50%)
+-- Workflow pauses completely until human resolves this
+-- ------------------------------------------------------------
+
+CREATE TABLE custom_product_requests (
+  request_id         UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+  rfp_id             UUID         NOT NULL REFERENCES rfp_documents(rfp_id)    ON DELETE CASCADE,
+  rfp_item_id        UUID         NOT NULL REFERENCES rfp_items(item_id)       ON DELETE CASCADE,
+  company_id         UUID         NOT NULL REFERENCES companies(company_id)    ON DELETE CASCADE,
+  closest_sku_id     UUID         REFERENCES product_catalog(sku_id)           ON DELETE SET NULL,
+  gap_analysis       TEXT         NOT NULL, -- NOT NULL: AI always generates this before creating request
+  requested_by       UUID         REFERENCES users(user_id) ON DELETE SET NULL,
+  assigned_to        UUID         REFERENCES users(user_id) ON DELETE SET NULL,
+  status             VARCHAR(20)  NOT NULL DEFAULT 'pending',
+  resolution_outcome VARCHAR(50), -- records the actual decision made
+  feasibility_notes  TEXT,
+  estimated_cost     NUMERIC(12,2),
+  created_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+  resolved_at        TIMESTAMPTZ,
+
+  CONSTRAINT chk_hitl_status
+    CHECK (status IN ('pending', 'approved', 'rejected', 'in_progress')),
+
+  CONSTRAINT chk_resolution_outcome
+    CHECK (resolution_outcome IN (
+      'use_nearest_sku',
+      'custom_manufacture',
+      'third_party_source',
+      'no_bid_this_item'
+    )),
+
+  -- If resolved, resolved_at must be set
+  CONSTRAINT chk_resolution_consistency
+    CHECK (
+      (status IN ('approved', 'rejected') AND resolved_at IS NOT NULL)
+      OR status IN ('pending', 'in_progress')
+    )
+);
+
+-- Index: HITL dashboard — fetch all pending requests for a company
+CREATE INDEX idx_hitl_company_status
+  ON custom_product_requests (company_id, status)
+  WHERE status IN ('pending', 'in_progress');
+
+
+
+
+-- ============================================================
+-- LEVEL 7 — Depends on everything above
+-- ============================================================
+
+
+-- ------------------------------------------------------------
+-- TABLE: response_documents
+-- Generated proposal documents — full approval chain tracked
+-- Three separate user FKs: edited_by, approved_by, submitted_by
+-- ------------------------------------------------------------
+
+CREATE TABLE response_documents (
+  response_id              UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+  rfp_id                   UUID         NOT NULL REFERENCES rfp_documents(rfp_id)  ON DELETE CASCADE,
+  company_id               UUID         NOT NULL REFERENCES companies(company_id)  ON DELETE CASCADE,
+  version                  INT          NOT NULL DEFAULT 1,
+  generated_document_path  VARCHAR(500) NOT NULL,
+  status                   VARCHAR(20)  NOT NULL DEFAULT 'draft',
+  is_edited                BOOLEAN      NOT NULL DEFAULT FALSE,
+  edited_by                UUID         REFERENCES users(user_id) ON DELETE SET NULL,
+  edited_at                TIMESTAMPTZ,
+  edit_summary             TEXT,
+  approved_by              UUID         REFERENCES users(user_id) ON DELETE SET NULL,
+  approved_at              TIMESTAMPTZ,
+  submitted_by             UUID         REFERENCES users(user_id) ON DELETE SET NULL,
+  created_at               TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+
+  -- Only one document version per RFP per version number
+  CONSTRAINT uq_response_version UNIQUE (rfp_id, version),
+
+  CONSTRAINT chk_response_status
+    CHECK (status IN ('draft', 'pending_approval', 'approved', 'submitted', 'rejected'))
+);
+
+-- Index: dashboard loads pending documents for review
+CREATE INDEX idx_response_docs_rfp
+  ON response_documents (rfp_id, status);
+
+
+-- ------------------------------------------------------------
+-- TABLE: rfp_status_history
+-- Immutable audit trail — every status transition of every RFP
+-- Never update or delete rows from this table
+-- ------------------------------------------------------------
+
+CREATE TABLE rfp_status_history (
+  history_id       UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+  rfp_id           UUID        NOT NULL REFERENCES rfp_documents(rfp_id) ON DELETE CASCADE,
+  old_status       VARCHAR(20) NOT NULL,
+  new_status       VARCHAR(20) NOT NULL,
+  changed_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  changed_by_type  VARCHAR(20) NOT NULL,
+  changed_by_id    UUID        REFERENCES users(user_id) ON DELETE SET NULL, -- users not user (was a typo)
+
+  -- Status values must match rfp_documents.status exactly
+  CONSTRAINT chk_old_status
+    CHECK (old_status IN ('new', 'processing', 'matched', 'submitted')),
+
+  CONSTRAINT chk_new_status
+    CHECK (new_status IN ('new', 'processing', 'matched', 'submitted')),
+
+  CONSTRAINT chk_changed_by_type
+    CHECK (changed_by_type IN ('system', 'user', 'agent')),
+
+  -- If changed by user, changed_by_id must be provided
+  -- If changed by system or agent, changed_by_id must be NULL
+  CONSTRAINT chk_changed_by_consistency
+    CHECK (
+      (changed_by_type = 'user'                    AND changed_by_id IS NOT NULL) OR
+      (changed_by_type IN ('system', 'agent') AND changed_by_id IS NULL)
+    ),
+
+  -- Only valid status progressions allowed
+  CONSTRAINT chk_valid_transition
+    CHECK (
+      (old_status = 'new'        AND new_status = 'processing') OR
+      (old_status = 'processing' AND new_status = 'matched')    OR
+      (old_status = 'matched'    AND new_status = 'submitted')
+    )
+);
+
+
+-- ------------------------------------------------------------
+-- TABLE: agent_execution_logs
+-- Immutable audit log for every AI agent execution
+-- Append-only — never update rows, only insert
+-- Grows forever — largest table in the system over time
+-- ------------------------------------------------------------
+
+CREATE TABLE agent_execution_logs (
+  log_id            UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+  rfp_id            UUID        REFERENCES rfp_documents(rfp_id) ON DELETE SET NULL,
+  company_id        UUID        NOT NULL REFERENCES companies(company_id) ON DELETE CASCADE,
+  agent_name        VARCHAR(100) NOT NULL,
+  task_type         VARCHAR(50)  NOT NULL,
+  execution_time_ms INT,
+  status            VARCHAR(20)  NOT NULL,
+  error_message     TEXT,
+  input_payload     JSONB,       -- structured input context (queryable)
+  output_payload    JSONB,       -- structured output summary (queryable)
+  created_at        TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+
+  -- All 7 agent task types covered 
+  CONSTRAINT chk_task_type
+    CHECK (task_type IN (
+      'rfp_discovery',       -- Sales Agent: scraping portals
+      'rfp_classification',  -- Sales Agent: relevance scoring
+      'matching',            -- Technical Agent: hybrid search
+      'pricing',             -- Pricing Agent: bid calculation
+      'document_generation', -- Response Generator: Word doc creation
+      'submission',          -- Sales Agent: final submission step
+      'bid_prioritization'   -- Bid Priority Agent: ranking competing RFPs
+    )),
+
+  CONSTRAINT chk_log_status
+    CHECK (status IN ('success', 'failed', 'partial'))
+);
+
+-- Index: fetch execution timeline for a specific RFP (dashboard + debugging)
+CREATE INDEX idx_agent_logs_rfp_agent
+  ON agent_execution_logs (rfp_id, agent_name, created_at DESC);
+
+-- GIN index: query inside JSONB payloads
+-- e.g. WHERE input_payload->>'rfp_id' = 'abc-123'
+CREATE INDEX idx_agent_logs_input_gin
+  ON agent_execution_logs USING GIN (input_payload);
+
+-- Index: company-level agent monitoring
+CREATE INDEX idx_agent_logs_company
+  ON agent_execution_logs (company_id, task_type, status, created_at DESC);
+
+
+-- ------------------------------------------------------------
+-- TABLE: notifications
+-- In-app alerts for all HOTL and HITL workflow gates
+-- Every human action required generates a notification
+-- ------------------------------------------------------------
+
+CREATE TABLE notifications (
+  notification_id  UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+  company_id       UUID         NOT NULL REFERENCES companies(company_id)    ON DELETE CASCADE,
+  user_id          UUID         NOT NULL REFERENCES users(user_id)           ON DELETE CASCADE,
+  rfp_id           UUID         REFERENCES rfp_documents(rfp_id)             ON DELETE CASCADE,
+  type             VARCHAR(50)  NOT NULL,
+  message          TEXT         NOT NULL,
+  metadata         JSONB,       -- structured context varies by notification type
+  is_read          BOOLEAN      NOT NULL DEFAULT FALSE,
+  read_at          TIMESTAMPTZ, -- set when user opens/dismisses notification
+
+  created_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+
+  CONSTRAINT chk_notification_type
+    CHECK (type IN (
+      'hitl_required',
+      'pricing_approval',
+      'match_review',
+      'submission_ready',
+      'rfp_deadline_warning',
+      'relevance_review',
+      'bid_outcome_required'
+    )),
+
+  -- read_at must be set if and only if is_read is TRUE
+  CONSTRAINT chk_read_consistency
+    CHECK (
+      (is_read = FALSE AND read_at IS NULL) OR
+      (is_read = TRUE  AND read_at IS NOT NULL)
+    )
+);
+
+-- Partial index: only unread notifications (dashboard loads this on every page)
+CREATE INDEX idx_notifications_user_unread
+  ON notifications (user_id, created_at DESC)
+  WHERE is_read = FALSE;
+
+-- Index: all notifications for an RFP
+CREATE INDEX idx_notifications_rfp
+  ON notifications (rfp_id)
+  WHERE rfp_id IS NOT NULL;
+
+
+-- ============================================================
+-- LEVEL 8 — Depends on everything above
+-- ============================================================
+
+
+-- ------------------------------------------------------------
+-- TABLE: bid_history
+-- Historical bid outcomes — the feedback loop foundation
+-- Every won/lost record makes future agent decisions smarter
+-- ------------------------------------------------------------
+
+CREATE TABLE bid_history (
+  bid_id                    UUID          PRIMARY KEY DEFAULT gen_random_uuid(),
+  rfp_id                    UUID          NOT NULL REFERENCES rfp_documents(rfp_id)  ON DELETE CASCADE,
+  company_id                UUID          NOT NULL REFERENCES companies(company_id)  ON DELETE CASCADE,
+  client_id                 UUID          NOT NULL REFERENCES client_profile(client_id) ON DELETE CASCADE,
+  result                    VARCHAR(20)   NOT NULL,
+  loss_reason               VARCHAR(50),
+  match_score_at_submission NUMERIC(5,4),
+  response_time_days        INT           NOT NULL, -- NOT NULL: core analytics field
+  contract_value            NUMERIC(14,2),
+  submitted_at              TIMESTAMPTZ,
+
+  CONSTRAINT chk_bid_result
+    CHECK (result IN ('won', 'lost', 'no_bid', 'pending')),
+
+  CONSTRAINT chk_loss_reason
+    CHECK (loss_reason IN (
+      'price_too_high',
+      'wrong_spec',
+      'late_submission',
+      'competitor_preferred',
+      'no_bid',
+      'unknown'
+    )),
+
+  -- Score must be between 0 and 1 (fixed: was unconstrained in original)
+  CONSTRAINT chk_match_score_range
+    CHECK (match_score_at_submission BETWEEN 0 AND 1),
+
+  CONSTRAINT chk_response_time_positive
+    CHECK (response_time_days >= 0)
+);
+
+
+
+
+-- ------------------------------------------------------------
+-- TABLE: bid_priority_scores
+-- Bid Priority Agent output — ranking of competing RFPs
+-- Append-only: new scores added each time agent re-runs
+-- weights_used stored as JSONB for full auditability
+-- ------------------------------------------------------------
+
+CREATE TABLE bid_priority_scores (
+  priority_id            UUID          PRIMARY KEY DEFAULT gen_random_uuid(),
+  company_id             UUID          NOT NULL REFERENCES companies(company_id)  ON DELETE CASCADE,
+  rfp_id                 UUID          NOT NULL REFERENCES rfp_documents(rfp_id)  ON DELETE CASCADE,
+  deadline_score         NUMERIC(5,4)  NOT NULL,
+  match_confidence_score NUMERIC(5,4)  NOT NULL,
+  client_win_rate_score  NUMERIC(5,4)  NOT NULL,
+  contract_value_score   NUMERIC(5,4)  NOT NULL,
+  composite_score        NUMERIC(5,4)  NOT NULL,
+  priority_rank          INT           NOT NULL,
+  llm_reasoning          TEXT,
+  weights_used           JSONB         NOT NULL, -- snapshot of weights at scoring time
+  scored_at              TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+
+  CONSTRAINT chk_deadline_score        CHECK (deadline_score        BETWEEN 0 AND 1),
+  CONSTRAINT chk_match_confidence      CHECK (match_confidence_score BETWEEN 0 AND 1),
+  CONSTRAINT chk_client_win_rate       CHECK (client_win_rate_score  BETWEEN 0 AND 1),
+  CONSTRAINT chk_contract_value_score  CHECK (contract_value_score   BETWEEN 0 AND 1),
+  CONSTRAINT chk_composite_score       CHECK (composite_score        BETWEEN 0 AND 1),
+  CONSTRAINT chk_priority_rank_positive CHECK (priority_rank > 0)
+);
+
+
+
+
+
